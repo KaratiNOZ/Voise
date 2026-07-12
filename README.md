@@ -73,11 +73,7 @@ python main.py
 
 ## 📖 Документация
 
-- 📘 **[QUICKSTART.md](QUICKSTART.md)** - Быстрый старт за 2 минуты
-- 📗 **[INSTALL.md](INSTALL.md)** - Подробная установка и troubleshooting
-- 📕 **[ARCHITECTURE.md](ARCHITECTURE.md)** - Техническая документация
-- 📙 **[EXAMPLES.md](EXAMPLES.md)** - Примеры использования API
-- ✅ **[CHECKLIST.md](CHECKLIST.md)** - Полный чек-лист проекта
+- 📘 **[README.md](README.md)**
 
 ## 💡 Как использовать
 
