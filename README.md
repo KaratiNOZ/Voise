@@ -46,7 +46,7 @@
 
 ### Windows (рекомендуется)
 
-1. **Скачайте проект** в `C:\Users\lelil\Desktop\Voise`
+1. **Скачайте проект** в `C:\Users\\Desktop\Voise`
 2. **Запустите** `install.bat` (автоматическая установка)
 3. **Запустите** `run.bat`
 4. **Пойте!** 🎵
@@ -55,7 +55,7 @@
 
 ```bash
 # Клонируйте репозиторий
-cd C:\Users\lelil\Desktop\Voise
+cd C:\Users\\Desktop\Voise
 
 # Создайте виртуальное окружение
 python -m venv venv
@@ -227,5 +227,3 @@ MIT License - свободное использование для личных 
 ---
 
 **Начните анализировать свой вокал прямо сейчас!** 🎤✨
-
-📖 См. [QUICKSTART.md](QUICKSTART.md) для быстрого старта
