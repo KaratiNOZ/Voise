@@ -21,5 +21,8 @@
     "window_width": 1050,
     "window_height": 780,
     "theme": "light"
+  },
+  "sequencer": {
+    "default_bpm": 100
   }
 }

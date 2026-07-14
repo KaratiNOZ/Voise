@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Определение типа голоса (грудной/фальцет)"""
 
+from collections import deque
+
 import numpy as np
 from scipy import signal
 from scipy.linalg import solve_toeplitz, LinAlgError
@@ -17,15 +19,27 @@ class VoiceTypeDetector:
         self.sample_rate = config['audio']['sample_rate']
         self.falsetto_threshold = config['voice_detection']['falsetto_threshold']
 
+        # --- Стабилизация решения ---
+        # Раньше тип голоса определялся заново на КАЖДОМ кадре без
+        # какой-либо памяти о предыдущих кадрах. Даже на идеально
+        # стабильно спетой ноте признаки (наклон спектра, отношение
+        # гармоник) чуть колеблются от кадра к кадру из-за шума
+        # микрофона и естественной микро-нестабильности голоса. Если
+        # falsetto_score оказывался рядом с порогом, результат
+        # дёргался между "falsetto" и "chest" каждый кадр.
+        #
+        # Решение - две меры:
+        # 1) Сглаживание score скользящим средним по последним кадрам.
+        # 2) Гистерезис: разные пороги для входа в фальцет и выхода
+        #    из него, так что решение не может "дребезжать" на границе.
+        smoothing_frames = config['voice_detection'].get('smoothing_frames', 6)
+        self._score_history = deque(maxlen=smoothing_frames)
+        self._hysteresis_margin = config['voice_detection'].get('hysteresis_margin', 0.08)
+        self._current_type = None  # None, 'falsetto' или 'chest'
+
     def calculate_formants(self, audio_data):
         """
         Вычислить форманты (резонансные частоты голосового тракта).
-
-        Раньше матрица автокорреляции R собиралась двойным Python-циклом
-        (~lpc_order^2 итераций на КАЖДЫЙ вызов) - это была одна из
-        основных причин нагрузки на CPU. Теперь используется
-        scipy.linalg.solve_toeplitz, который решает ту же систему
-        Юла-Уокера значительно быстрее и без ручных циклов.
 
         Args:
             audio_data: numpy array с аудио данными
@@ -46,7 +60,6 @@ class VoiceTypeDetector:
             return []
 
         try:
-            # Симметричная теплицева система Юла-Уокера: R * a = r[1:]
             a = solve_toeplitz(r[:lpc_order], r[1:lpc_order + 1])
         except (LinAlgError, ValueError):
             return []
@@ -64,8 +77,13 @@ class VoiceTypeDetector:
 
     def calculate_spectral_slope(self, audio_data):
         """
-        Вычислить наклон спектра.
-        Фальцет имеет более крутой спад высоких частот
+        Вычислить наклон спектра. Фальцет имеет более крутой спад
+        высоких частот.
+
+        Кадр окуривается окном Ханна перед FFT - без окна края кадра
+        обрезаются резко, что даёт спектральную утечку и шумный,
+        дёргающийся от кадра к кадру наклон, особенно на границе
+        порога falsetto_threshold.
 
         Args:
             audio_data: numpy array с аудио данными
@@ -73,8 +91,11 @@ class VoiceTypeDetector:
         Returns:
             Наклон спектра в дБ/Hz
         """
-        spectrum = np.abs(np.fft.rfft(audio_data))
-        freqs = np.fft.rfftfreq(len(audio_data), 1 / self.sample_rate)
+        window = np.hanning(len(audio_data))
+        windowed = audio_data * window
+
+        spectrum = np.abs(np.fft.rfft(windowed))
+        freqs = np.fft.rfftfreq(len(windowed), 1 / self.sample_rate)
 
         spectrum_db = 20 * np.log10(spectrum + 1e-10)
 
@@ -89,19 +110,30 @@ class VoiceTypeDetector:
 
         return slope
 
-    def calculate_harmonic_ratio(self, audio_data):
+    def calculate_harmonic_ratio(self, audio_data, f0_hint=None):
         """
         Вычислить соотношение четных и нечетных гармоник.
-        Фальцет имеет больше нечетных гармоник
+        Фальцет имеет больше нечетных гармоник.
+
+        Раньше f0 бралась как "первый найденный пик спектра" -
+        ненадёжная оценка, которая скачет от кадра к кадру (шум,
+        побочные пики рядом с порогом height=max*0.1 то появляются,
+        то исчезают). Теперь если снаружи уже известна частота
+        (сглаженная в PitchDetector), используем её - она гораздо
+        стабильнее.
 
         Args:
             audio_data: numpy array с аудио данными
+            f0_hint: известная (сглаженная) частота основного тона, Hz
 
         Returns:
             Отношение четных к нечетным гармоникам
         """
-        spectrum = np.abs(np.fft.rfft(audio_data))
-        freqs = np.fft.rfftfreq(len(audio_data), 1 / self.sample_rate)
+        window = np.hanning(len(audio_data))
+        windowed = audio_data * window
+
+        spectrum = np.abs(np.fft.rfft(windowed))
+        freqs = np.fft.rfftfreq(len(windowed), 1 / self.sample_rate)
 
         peaks, properties = signal.find_peaks(spectrum, height=np.max(spectrum) * 0.1)
 
@@ -111,7 +143,10 @@ class VoiceTypeDetector:
         peak_freqs = freqs[peaks]
         peak_heights = properties['peak_heights']
 
-        f0 = peak_freqs[0]
+        if f0_hint and f0_hint > 0:
+            f0 = f0_hint
+        else:
+            f0 = peak_freqs[0]
 
         if f0 < 50:
             return 1.0
@@ -148,36 +183,78 @@ class VoiceTypeDetector:
         if audio_data is None or len(audio_data) < 512:
             return None
 
+        f0_hint = None
+        if detected_pitch and detected_pitch.get('frequency'):
+            f0_hint = detected_pitch['frequency']
+
         try:
             formants = self.calculate_formants(audio_data)
             spectral_slope = self.calculate_spectral_slope(audio_data)
-            harmonic_ratio = self.calculate_harmonic_ratio(audio_data)
+            harmonic_ratio = self.calculate_harmonic_ratio(audio_data, f0_hint=f0_hint)
         except Exception:
             logger.exception("Ошибка при вычислении признаков типа голоса")
             return None
 
-        falsetto_score = 0
+        # --- Голосование вместо суммы весов ---
+        # Раньше falsetto_score был простой суммой весов, из-за чего
+        # ДВА слабых, по отдельности ничего не доказывающих сигнала
+        # (например, чуть завышенный spectral_slope + просто высокая
+        # нота) складывались и пробивали даже строгий порог 0.6 -
+        # реальный грудной голос получал "Фальцет (вероятно)".
+        #
+        # Теперь каждый признак голосует независимо: 1.0 - сильный
+        # сигнал, 0.5 - слабый/неоднозначный, 0.0 - против фальцета.
+        # Итоговый score штрафуется вдвое, если среди голосов нет ни
+        # одного СИЛЬНОГО - тогда одни слабые сигналы не могут поднять
+        # score выше половины порога сами по себе.
+        votes = []
 
         if spectral_slope < -0.01:
-            falsetto_score += 0.4
+            votes.append(1.0)
         elif spectral_slope < -0.005:
-            falsetto_score += 0.2
+            votes.append(0.5)
+        else:
+            votes.append(0.0)
 
         if harmonic_ratio < 0.5:
-            falsetto_score += 0.4
+            votes.append(1.0)
         elif harmonic_ratio < 0.7:
-            falsetto_score += 0.2
+            votes.append(0.5)
+        else:
+            votes.append(0.0)
 
-        if detected_pitch and detected_pitch.get('frequency'):
-            freq = detected_pitch['frequency']
-            if freq > 350:
-                falsetto_score += 0.2
+        if f0_hint and f0_hint > 350:
+            votes.append(0.5)  # частота сама по себе - только вспомогательный сигнал
+        else:
+            votes.append(0.0)
 
-        falsetto_score = min(1.0, falsetto_score)
+        strong_votes = sum(1 for v in votes if v >= 1.0)
+        raw_score = sum(votes) / len(votes)
 
-        is_falsetto = falsetto_score >= self.falsetto_threshold
+        if strong_votes == 0:
+            raw_score *= 0.5
+
+        falsetto_score = min(1.0, raw_score)
+
+        # --- Сглаживание по нескольким последним кадрам ---
+        self._score_history.append(falsetto_score)
+        smoothed_score = float(np.mean(self._score_history))
+
+        # --- Гистерезис вокруг порога ---
+        # Если сейчас "falsetto" - выйти из него можно только заметно
+        # ниже порога. Если сейчас "chest" - войти во "falsetto" можно
+        # только заметно выше порога. Это и убирает дребезг на границе.
+        if self._current_type == 'falsetto':
+            is_falsetto = smoothed_score >= (self.falsetto_threshold - self._hysteresis_margin)
+        elif self._current_type == 'chest':
+            is_falsetto = smoothed_score >= (self.falsetto_threshold + self._hysteresis_margin)
+        else:
+            is_falsetto = smoothed_score >= self.falsetto_threshold
+
         voice_type = 'falsetto' if is_falsetto else 'chest'
-        confidence = falsetto_score if is_falsetto else (1.0 - falsetto_score)
+        self._current_type = voice_type
+
+        confidence = smoothed_score if is_falsetto else (1.0 - smoothed_score)
 
         return {
             'type': voice_type,
@@ -186,7 +263,8 @@ class VoiceTypeDetector:
                 'formants': [float(f) for f in formants],
                 'spectral_slope': float(spectral_slope),
                 'harmonic_ratio': float(harmonic_ratio),
-                'falsetto_score': float(falsetto_score)
+                'falsetto_score': float(falsetto_score),
+                'smoothed_score': smoothed_score
             }
         }
 

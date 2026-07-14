@@ -5,14 +5,17 @@ import time
 
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QTextEdit, QGroupBox,
-                             QProgressBar, QAction, QMessageBox)
+                             QProgressBar, QAction, QMessageBox, QTabWidget,
+                             QSpinBox, QCheckBox, QComboBox, QScrollArea)
 from PyQt5.QtCore import QTimer, Qt
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QKeySequence
 
 from src.audio.analyzer import VoiceAnalyzer
 from src.audio.synthesizer import SimpleSynthesizer
 from src.audio.worker import AnalysisWorker
+from src.audio.sequencer import Sequencer
 from src.gui.midi_keyboard import MidiKeyboard
+from src.gui.piano_roll import PianoRollWidget
 from src.gui.settings import SettingsDialog
 from src.gui.level_meter import LevelMeter
 from src.gui.theme import APP_STYLESHEET
@@ -30,13 +33,23 @@ class MainWindow(QMainWindow):
         self.config = config
         self.analyzer = VoiceAnalyzer(config)
         self.synthesizer = SimpleSynthesizer(config['audio']['sample_rate'])
+        self.sequencer = Sequencer(self.synthesizer, self.analyzer)
 
         self.is_recording = False
         self.current_analysis = None
         self.analysis_worker = None
         self._recording_started_at = None
 
+        # Состояние оценки текущей ноты секвенсора: пока нота играет,
+        # сюда копятся результаты pitch_match из каждого кадра анализа,
+        # а когда нота заканчивается - по ним решаем "попал/не попал".
+        self._seq_active_note = None   # (step, note) или None
+        self._seq_note_matches = []
+        self._seq_hits = 0
+        self._seq_total = 0
+
         self.init_ui()
+        self._connect_sequencer_signals()
 
         # VU-метр обновляем лёгким UI-таймером - это не тяжёлые вычисления,
         # а просто чтение уже посчитанного значения из recorder, поэтому
@@ -71,9 +84,37 @@ class MainWindow(QMainWindow):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
 
+        root_layout = QVBoxLayout()
+        root_layout.setSpacing(10)
+        root_layout.setContentsMargins(12, 12, 12, 12)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._create_free_mode_tab(), "🎤 Свободное пение")
+        self.tabs.addTab(self._create_sequencer_tab(), "🎼 Секвенсор")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        root_layout.addWidget(self.tabs, stretch=1)
+
+        # Лог сообщений - общий для обеих вкладок
+        log_group = QGroupBox("📝 Лог")
+        log_layout = QVBoxLayout()
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumHeight(110)
+        log_layout.addWidget(self.log_text)
+        log_group.setLayout(log_layout)
+        root_layout.addWidget(log_group)
+
+        central_widget.setLayout(root_layout)
+
+        # Статус-бар
+        self.status_bar = self.statusBar()
+        self._update_status_bar()
+
+    def _create_free_mode_tab(self):
+        """Вкладка свободного пения (исходный режим: одна целевая нота)"""
+        tab = QWidget()
         layout = QVBoxLayout()
         layout.setSpacing(10)
-        layout.setContentsMargins(12, 12, 12, 12)
 
         # MIDI клавиатура
         keyboard_group = QGroupBox("🎹 MIDI клавиатура")
@@ -180,21 +221,114 @@ class MainWindow(QMainWindow):
         results_group.setLayout(results_layout)
         layout.addWidget(results_group)
 
-        # Лог сообщений
-        log_group = QGroupBox("📝 Лог")
-        log_layout = QVBoxLayout()
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(110)
-        log_layout.addWidget(self.log_text)
-        log_group.setLayout(log_layout)
-        layout.addWidget(log_group)
+        tab.setLayout(layout)
+        return tab
 
-        central_widget.setLayout(layout)
+    def _create_sequencer_tab(self):
+        """
+        Вкладка "Секвенсор" - пиано-ролл как в FL Studio: расставляете
+        ноты мышкой, жмёте Play (или Space) - они играются одна за
+        другой как мелодия, а микрофон в реальном времени сверяется с
+        каждой нотой и красит её зелёным (попал) или красным (не попал).
+        """
+        tab = QWidget()
+        layout = QVBoxLayout()
+        layout.setSpacing(10)
 
-        # Статус-бар
-        self.status_bar = self.statusBar()
-        self._update_status_bar()
+        hint = QLabel(
+            "ЛКМ на пустом месте - нарисовать ноту (тяните для длины/высоты) · "
+            "ЛКМ по телу ноты - передвинуть · ЛКМ по краю - изменить длину · "
+            "ПКМ - удалить · Space или ▶ - играть"
+        )
+        hint.setStyleSheet("color: #868e96; font-size: 11px;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        # Пиано-ролл в прокручиваемой области
+        self.piano_roll = PianoRollWidget(min_note=48, max_note=84, num_steps=32)
+        self.piano_roll.notes_changed.connect(self._on_piano_roll_changed)
+        self.piano_roll.note_preview.connect(self._on_piano_roll_preview)
+        self.piano_roll.preview_stopped.connect(self._on_piano_roll_preview_stop)
+
+        scroll = QScrollArea()
+        scroll.setWidget(self.piano_roll)
+        scroll.setWidgetResizable(False)
+        scroll.setMinimumHeight(280)
+        layout.addWidget(scroll, stretch=1)
+
+        # Транспорт (play/stop, темп, длина, повтор)
+        transport_layout = QHBoxLayout()
+
+        self.seq_play_btn = QPushButton("▶ Играть")
+        self.seq_play_btn.setObjectName("recordButton")
+        self.seq_play_btn.setMinimumHeight(44)
+        self.seq_play_btn.clicked.connect(self.toggle_sequencer)
+        transport_layout.addWidget(self.seq_play_btn, stretch=2)
+
+        self.seq_clear_btn = QPushButton("Очистить всё")
+        self.seq_clear_btn.setObjectName("secondaryButton")
+        self.seq_clear_btn.setMinimumHeight(44)
+        self.seq_clear_btn.clicked.connect(self._clear_sequencer)
+        transport_layout.addWidget(self.seq_clear_btn, stretch=1)
+
+        transport_layout.addWidget(QLabel("Темп:"))
+        self.seq_bpm_spin = QSpinBox()
+        self.seq_bpm_spin.setRange(40, 240)
+        self.seq_bpm_spin.setValue(self.config.get('sequencer', {}).get('default_bpm', 100))
+        self.seq_bpm_spin.setSuffix(" BPM")
+        self.seq_bpm_spin.valueChanged.connect(
+            lambda v: self.sequencer.set_bpm(v)
+        )
+        transport_layout.addWidget(self.seq_bpm_spin)
+
+        transport_layout.addWidget(QLabel("Длина:"))
+        self.seq_length_combo = QComboBox()
+        self.seq_length_combo.addItems(["16 шагов", "32 шага", "64 шага"])
+        self.seq_length_combo.setCurrentIndex(1)
+        self.seq_length_combo.currentIndexChanged.connect(self._on_seq_length_changed)
+        transport_layout.addWidget(self.seq_length_combo)
+
+        self.seq_loop_check = QCheckBox("Повтор")
+        transport_layout.addWidget(self.seq_loop_check)
+
+        layout.addLayout(transport_layout)
+
+        # Текущее состояние воспроизведения + уровень сигнала
+        status_layout = QHBoxLayout()
+
+        self.seq_current_note_label = QLabel("Готово к запуску")
+        self.seq_current_note_label.setFont(QFont('Segoe UI', 12, QFont.Bold))
+        status_layout.addWidget(self.seq_current_note_label, stretch=2)
+
+        self.seq_score_label = QLabel("Точность: 0/0")
+        self.seq_score_label.setAlignment(Qt.AlignRight)
+        status_layout.addWidget(self.seq_score_label, stretch=1)
+
+        layout.addLayout(status_layout)
+
+        # Реал-тайм попадание в текущую ноту секвенсора - тот же принцип,
+        # что и на вкладке свободного пения, только источник целевой ноты -
+        # не клавиатура, а сам секвенсор
+        self.seq_match_group = QGroupBox("🎯 Попадание в ноту (реал-тайм)")
+        seq_match_layout = QVBoxLayout()
+        self.seq_match_label = QLabel("—")
+        self.seq_match_label.setAlignment(Qt.AlignCenter)
+        self.seq_match_label.setFont(QFont('Segoe UI', 14, QFont.Bold))
+        self.seq_match_progress = QProgressBar()
+        self.seq_match_progress.setRange(0, 100)
+        seq_match_layout.addWidget(self.seq_match_label)
+        seq_match_layout.addWidget(self.seq_match_progress)
+        self.seq_match_group.setLayout(seq_match_layout)
+        layout.addWidget(self.seq_match_group)
+
+        level_layout = QHBoxLayout()
+        level_layout.addWidget(QLabel("Уровень сигнала:"))
+        self.seq_level_meter = LevelMeter()
+        level_layout.addWidget(self.seq_level_meter, stretch=1)
+        layout.addLayout(level_layout)
+
+        tab.setLayout(layout)
+        return tab
 
     def _create_menu(self):
         """Создать меню"""
@@ -216,6 +350,20 @@ class MainWindow(QMainWindow):
         settings_action.triggered.connect(self.open_settings)
         settings_menu.addAction(settings_action)
 
+        # Секвенсор
+        sequencer_menu = menubar.addMenu('Секвенсор')
+
+        # QAction-шорткат надёжнее, чем keyPressEvent: срабатывает,
+        # даже если фокус сейчас на кнопке/спинбоксе, а не на пиано-ролле
+        self.seq_play_action = QAction('▶ Играть / ⏹ Стоп', self)
+        self.seq_play_action.setShortcut(QKeySequence(Qt.Key_Space))
+        self.seq_play_action.triggered.connect(self._on_space_pressed)
+        sequencer_menu.addAction(self.seq_play_action)
+
+        seq_clear_action = QAction('Очистить пиано-ролл', self)
+        seq_clear_action.triggered.connect(self._clear_sequencer)
+        sequencer_menu.addAction(seq_clear_action)
+
         # Помощь
         help_menu = menubar.addMenu('Помощь')
 
@@ -228,7 +376,7 @@ class MainWindow(QMainWindow):
         help_menu.addAction(about_action)
 
     # ------------------------------------------------------------------ #
-    #  MIDI клавиатура
+    #  MIDI клавиатура (свободное пение)
     # ------------------------------------------------------------------ #
 
     def on_note_pressed(self, midi_note):
@@ -264,6 +412,204 @@ class MainWindow(QMainWindow):
         self.target_note_label.setText("Выберите ноту на клавиатуре")
         self.match_group.setVisible(False)
         self.log("Целевая нота очищена")
+
+    # ------------------------------------------------------------------ #
+    #  Секвенсор (режим "как в FL Studio")
+    # ------------------------------------------------------------------ #
+
+    def _connect_sequencer_signals(self):
+        self.sequencer.step_changed.connect(self.piano_roll.set_playhead)
+        self.sequencer.note_started.connect(self._on_seq_note_started)
+        self.sequencer.note_ended.connect(self._on_seq_note_ended)
+        self.sequencer.playback_finished.connect(self._on_seq_finished)
+
+    def toggle_sequencer(self):
+        """Запустить/остановить воспроизведение секвенса"""
+        if self.sequencer.is_playing():
+            self.sequencer.stop()
+            self._update_seq_play_button(False)
+            self.seq_current_note_label.setText("Остановлено")
+            self._reset_seq_live_match()
+            self.log("Секвенсор остановлен")
+            return
+
+        notes = self.piano_roll.get_notes()
+        if not notes:
+            QMessageBox.information(
+                self, "Секвенсор",
+                "Сначала расставьте ноты на пиано-ролле:\n"
+                "ЛКМ - поставить ноту (тяните вправо для длительности), "
+                "ЛКМ по ноте или ПКМ - удалить."
+            )
+            return
+
+        # Играть можно только когда идёт запись с микрофона - если она
+        # ещё не запущена, включаем её автоматически
+        if not self.is_recording:
+            self.start_recording()
+            if not self.is_recording:
+                # start_recording мог не удаться (нет микрофона и т.п.)
+                return
+
+        self.piano_roll.clear_results()
+        self._seq_hits = 0
+        self._seq_total = 0
+        self._seq_active_note = None
+        self._seq_note_matches = []
+        self.seq_score_label.setText("Точность: 0/0")
+        self._reset_seq_live_match()
+
+        bpm = self.seq_bpm_spin.value()
+        loop = self.seq_loop_check.isChecked()
+        num_steps = self.piano_roll.num_steps
+
+        self.sequencer.load(notes, num_steps, bpm, steps_per_beat=4, loop=loop)
+        self.sequencer.start()
+        self._update_seq_play_button(True)
+        self.log(f"Секвенсор запущен: {len(notes)} нот, {bpm} BPM")
+
+    def _update_seq_play_button(self, playing):
+        if playing:
+            self.seq_play_btn.setText("⏹ Стоп")
+            self.seq_play_btn.setObjectName("recordButtonActive")
+        else:
+            self.seq_play_btn.setText("▶ Играть")
+            self.seq_play_btn.setObjectName("recordButton")
+        self._refresh_button_style(self.seq_play_btn)
+
+    def _on_space_pressed(self):
+        """Space (через QAction) переключает play/stop только на вкладке секвенсора"""
+        if self.tabs.currentIndex() == 1:
+            self.toggle_sequencer()
+
+    def _on_tab_changed(self, index):
+        """При уходе со вкладки секвенсора останавливаем воспроизведение"""
+        if index != 1 and self.sequencer.is_playing():
+            self.sequencer.stop()
+            self._update_seq_play_button(False)
+            self.seq_current_note_label.setText("Остановлено (смена вкладки)")
+            self.log("Секвенсор остановлен (смена вкладки)")
+
+    def _clear_sequencer(self):
+        """Очистить пиано-ролл и сбросить результаты/счёт"""
+        if self.sequencer.is_playing():
+            self.sequencer.stop()
+            self._update_seq_play_button(False)
+        self.piano_roll.clear_notes()
+        self._seq_hits = 0
+        self._seq_total = 0
+        self.seq_score_label.setText("Точность: 0/0")
+        self.seq_current_note_label.setText("Готово к запуску")
+        self.log("Пиано-ролл очищен")
+
+    def _on_piano_roll_changed(self):
+        """Пользователь отредактировал ноты - подсветка результатов устарела"""
+        if not self.sequencer.is_playing():
+            self.piano_roll.clear_results()
+            self._seq_hits = 0
+            self._seq_total = 0
+            self.seq_score_label.setText("Точность: 0/0")
+
+    def _on_seq_length_changed(self, index):
+        steps = [16, 32, 64][index]
+        self.piano_roll.set_num_steps(steps)
+
+    def _on_seq_note_started(self, step, note, length):
+        """Секвенсор начал играть ноту - готовимся собирать результаты попадания"""
+        self._seq_active_note = (step, note)
+        self._seq_note_matches = []
+        note_name = self.analyzer.pitch_detector.midi_to_note_name(note)
+        self.seq_current_note_label.setText(f"🎵 Играет: {note_name} - пойте её!")
+        self._reset_seq_live_match(waiting=True)
+
+    def _on_seq_note_ended(self, step, note):
+        """Нота закончилась - подводим итог по накопленным кадрам анализа"""
+        matches = self._seq_note_matches
+        self._seq_active_note = None
+        self._seq_note_matches = []
+
+        if not matches:
+            result = 'none'
+        else:
+            hit_ratio = sum(1 for m in matches if m) / len(matches)
+            result = 'hit' if hit_ratio >= 0.5 else 'miss'
+
+        self.piano_roll.set_note_result(step, note, result)
+
+        self._seq_total += 1
+        if result == 'hit':
+            self._seq_hits += 1
+
+        pct = (self._seq_hits / self._seq_total * 100) if self._seq_total else 0
+        self.seq_score_label.setText(f"Точность: {self._seq_hits}/{self._seq_total} ({pct:.0f}%)")
+
+        note_name = self.analyzer.pitch_detector.midi_to_note_name(note)
+        if result == 'hit':
+            self.log(f"✅ Попал в {note_name}")
+        elif result == 'miss':
+            self.log(f"❌ Не попал в {note_name}")
+        else:
+            self.log(f"— Голос не обнаружен на {note_name}")
+
+    def _on_seq_finished(self):
+        """Секвенс доиграл до конца (без повтора)"""
+        self._update_seq_play_button(False)
+        self.seq_current_note_label.setText("Секвенс закончен")
+        self._reset_seq_live_match()
+        self.log(f"Секвенсор: воспроизведение завершено. Итог: {self._seq_hits}/{self._seq_total}")
+
+    def _reset_seq_live_match(self, waiting=False):
+        """Сбросить реал-тайм шкалу попадания в секвенсоре"""
+        self.seq_match_label.setText("Пойте..." if waiting else "—")
+        self.seq_match_label.setStyleSheet("")
+        self.seq_match_progress.setValue(0)
+
+    def _update_seq_live_match(self, result):
+        """Обновить реал-тайм шкалу попадания в ноту секвенсора (вызывается
+        на каждом кадре анализа, пока играет нота секвенсора) - работает
+        так же, как match_group на вкладке свободного пения"""
+        if not result.get('has_voice'):
+            self.seq_match_label.setText("Пойте...")
+            self.seq_match_label.setStyleSheet("")
+            return
+
+        match = result.get('pitch_match')
+        if match is None:
+            return
+
+        if match['match']:
+            self.seq_match_label.setText(f"✅ Попадание! {match['percentage']:.0f}%")
+            self.seq_match_label.setStyleSheet("color: #40c057;")
+        else:
+            cents_off = match['cents_off']
+            arrow = "↑" if cents_off > 0 else "↓"
+            self.seq_match_label.setText(f"{arrow} {abs(cents_off):.0f} центов")
+            self.seq_match_label.setStyleSheet("color: #fa5252; font-weight: bold;")
+
+        self.seq_match_progress.setValue(int(match['percentage']))
+
+    # ------------------------------------------------------------------ #
+    #  Предпрослушивание звука при редактировании пиано-ролла
+    # ------------------------------------------------------------------ #
+
+    def _on_piano_roll_preview(self, midi_note):
+        """Проиграть ноту при её создании/перемещении на пиано-ролле,
+        чтобы было слышно, какая высота получается"""
+        if self.sequencer.is_playing():
+            return
+        try:
+            self.synthesizer.start_note(midi_note)
+        except Exception:
+            logger.exception("Ошибка предпрослушивания ноты пиано-ролла")
+
+    def _on_piano_roll_preview_stop(self):
+        """Отпустили мышь после редактирования ноты - звук выключить"""
+        if self.sequencer.is_playing():
+            return
+        try:
+            self.synthesizer.stop_note()
+        except Exception:
+            logger.exception("Ошибка остановки предпрослушивания пиано-ролла")
 
     # ------------------------------------------------------------------ #
     #  Запись и анализ
@@ -309,6 +655,10 @@ class MainWindow(QMainWindow):
 
     def stop_recording(self):
         """Остановить запись"""
+        if self.sequencer.is_playing():
+            self.sequencer.stop()
+            self._update_seq_play_button(False)
+
         if self.analysis_worker is not None:
             self.analysis_worker.stop()
             self.analysis_worker = None
@@ -327,6 +677,7 @@ class MainWindow(QMainWindow):
         self.level_timer.stop()
         self.status_timer.stop()
         self.level_meter.set_level(self.level_meter.min_db)
+        self.seq_level_meter.set_level(self.seq_level_meter.min_db)
 
         self._update_status_bar()
         self.log("Запись остановлена")
@@ -346,6 +697,7 @@ class MainWindow(QMainWindow):
         try:
             db = self.analyzer.get_input_level_db()
             self.level_meter.set_level(db)
+            self.seq_level_meter.set_level(db)
         except Exception:
             logger.exception("Ошибка обновления VU-метра")
 
@@ -368,6 +720,15 @@ class MainWindow(QMainWindow):
     def update_analysis(self, result):
         """Обновить результаты анализа (вызывается сигналом из фонового потока)"""
         self.current_analysis = result
+
+        # Если сейчас играет нота секвенсора - копим её результаты
+        # попадания независимо от того, какая вкладка сейчас открыта
+        if self._seq_active_note is not None:
+            self._update_seq_live_match(result)
+            if result.get('has_voice'):
+                match = result.get('pitch_match')
+                if match is not None:
+                    self._seq_note_matches.append(bool(match['match']))
 
         if not result.get('has_voice'):
             self.info_label.setText(result.get('message', 'Нет голоса'))
@@ -456,6 +817,7 @@ class MainWindow(QMainWindow):
 
         try:
             self.analyzer = VoiceAnalyzer(self.config)
+            self.sequencer.analyzer = self.analyzer
         except Exception:
             logger.exception("Не удалось применить новые настройки анализатора")
             QMessageBox.warning(
@@ -493,9 +855,11 @@ class MainWindow(QMainWindow):
             "<li>Анализ качества звука</li>"
             "<li>Определение типа голоса (фальцет/грудной)</li>"
             "<li>Индикатор уровня сигнала</li>"
+            "<li>Секвенсор: пиано-ролл как в FL Studio (перемещение, ресайз, "
+            "звук при редактировании) с проверкой пения по нотам в реальном времени</li>"
             "<li>Светлая/тёмная тема</li>"
             "</ul>"
-            "<p>Версия: 2.0</p>"
+            "<p>Версия: 2.1</p>"
         )
 
     def log(self, message):
@@ -506,6 +870,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """Обработка закрытия окна"""
         try:
+            if self.sequencer.is_playing():
+                self.sequencer.stop()
             if self.is_recording:
                 self.stop_recording()
             self.synthesizer.cleanup()
