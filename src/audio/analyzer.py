@@ -5,6 +5,7 @@ from src.audio.processor import AudioProcessor
 from src.detection.pitch import PitchDetector
 from src.detection.quality import QualityAnalyzer
 from src.detection.voice_type import VoiceTypeDetector
+from src.detection.register import RegisterAnalyzer, StrainDetector
 from src.crash_logger import get_logger
 
 logger = get_logger()
@@ -22,6 +23,8 @@ class VoiceAnalyzer:
         self.pitch_detector = PitchDetector(config)
         self.quality_analyzer = QualityAnalyzer(config)
         self.voice_type_detector = VoiceTypeDetector(config)
+        self.register_analyzer = RegisterAnalyzer()
+        self.strain_detector = StrainDetector()
         
         # Целевая нота для проверки
         self.target_frequency = None
@@ -48,6 +51,7 @@ class VoiceAnalyzer:
         
     def start_recording(self):
         """Начать запись с микрофона"""
+        self.strain_detector.reset()
         self.recorder.start()
         
     def stop_recording(self):
@@ -122,6 +126,17 @@ class VoiceAnalyzer:
                     'features': {}
                 }
             
+            # SLS-анализ: непрерывный регистр (грудной..фальцет) поверх
+            # уже посчитанного voice_type_data, плюс детекция зажатости
+            # и срывов по короткой истории последних кадров. Дешёвые
+            # вычисления - без FFT/LPC, только числа, которые уже есть.
+            register_data = self.register_analyzer.estimate(voice_type_data, quality_data)
+            strain_data = self.strain_detector.update(
+                pitch_data['frequency'],
+                quality_data['hnr'],
+                register_data['register_mix']
+            )
+
             # Проверка попадания в ноту (если задана целевая нота)
             pitch_match = None
             if self.target_frequency is not None:
@@ -138,6 +153,8 @@ class VoiceAnalyzer:
                 'pitch': pitch_data,
                 'quality': quality_data,
                 'voice_type': voice_type_data,
+                'register': register_data,
+                'strain': strain_data,
                 'pitch_match': pitch_match,
                 'target_note': {
                     'midi': self.target_midi_note,
@@ -203,6 +220,72 @@ class VoiceAnalyzer:
             
         return "\n".join(messages)
         
+    def get_coach_feedback(self, analysis_result):
+        """
+        Человекочитаемая SLS-подсказка на основе register/strain,
+        а не просто "попал/не попал".
+
+        Args:
+            analysis_result: результат от analyze_chunk
+
+        Returns:
+            dict {'headline': str, 'detail': str} или None
+        """
+        if not analysis_result or not analysis_result.get('has_voice'):
+            return None
+
+        strain = analysis_result.get('strain')
+        register = analysis_result.get('register')
+        pitch_match = analysis_result.get('pitch_match')
+
+        if strain is None or register is None:
+            return None
+
+        if strain['break_detected']:
+            return {
+                'headline': "⚠️ Срыв на переходе",
+                'detail': "Сбавь громкость и скорость ровно в точке перехода регистра, "
+                          "не дави на гортань в этом месте.",
+            }
+
+        if strain['strain_score'] > 0.6:
+            return {
+                'headline': "😬 Голос зажат",
+                'detail': "Слышно напряжение - расслабь челюсть и корень языка, "
+                          "попробуй петь на лёгком зевке.",
+            }
+
+        if register['label'] in ("нижний микст", "микст", "верхний микст") and strain['strain_score'] < 0.3:
+            return {
+                'headline': f"✨ Хороший {register['label']}",
+                'detail': "Именно так и звучит SLS-микст - держи это ощущение.",
+            }
+
+        if pitch_match is not None and not pitch_match['match']:
+            direction = "выше" if pitch_match['cents_off'] < 0 else "ниже"
+            return {
+                'headline': f"🎯 Мимо ноты, нужно {direction}",
+                'detail': f"Отклонение {abs(pitch_match['cents_off']):.0f} центов.",
+            }
+
+        if register['label'] == "фальцет" and strain['strain_score'] < 0.3:
+            return {
+                'headline': "🎈 Чистый фальцет",
+                'detail': "Легко и свободно - попробуй чуть больше опоры дыхания, "
+                          "чтобы приблизиться к миксту.",
+            }
+
+        if register['label'] == "грудной" and strain['strain_score'] < 0.3:
+            return {
+                'headline': "💪 Хороший грудной регистр",
+                'detail': "Уверенно и свободно - можно пробовать подниматься выше в микст.",
+            }
+
+        return {
+            'headline': "👍 Неплохо",
+            'detail': "Стабильно, без явных проблем.",
+        }
+
     def get_device_list(self):
         """Получить список доступных аудио устройств"""
         return AudioRecorder.list_devices()

@@ -204,6 +204,41 @@ class MainWindow(QMainWindow):
 
         results_layout.addLayout(details_layout)
 
+        # Регистр (грудной..фальцет) и зажатость (SLS-режим)
+        sls_layout = QHBoxLayout()
+
+        register_group = QGroupBox("🎚️ Регистр")
+        register_layout = QVBoxLayout()
+        self.register_label = QLabel("—")
+        self.register_label.setAlignment(Qt.AlignCenter)
+        self.register_progress = QProgressBar()
+        self.register_progress.setRange(0, 100)
+        self.register_progress.setFormat("грудной ⟷ фальцет")
+        register_layout.addWidget(self.register_label)
+        register_layout.addWidget(self.register_progress)
+        register_group.setLayout(register_layout)
+        sls_layout.addWidget(register_group)
+
+        strain_group = QGroupBox("😬 Зажатость")
+        strain_layout = QVBoxLayout()
+        self.strain_label = QLabel("—")
+        self.strain_label.setAlignment(Qt.AlignCenter)
+        self.strain_progress = QProgressBar()
+        self.strain_progress.setRange(0, 100)
+        strain_layout.addWidget(self.strain_label)
+        strain_layout.addWidget(self.strain_progress)
+        strain_group.setLayout(strain_layout)
+        sls_layout.addWidget(strain_group)
+
+        results_layout.addLayout(sls_layout)
+
+        self.coach_label = QLabel("")
+        self.coach_label.setAlignment(Qt.AlignCenter)
+        self.coach_label.setWordWrap(True)
+        self.coach_label.setFont(QFont('Segoe UI', 11))
+        self.coach_label.setStyleSheet("color: #495057; padding: 4px;")
+        results_layout.addWidget(self.coach_label)
+
         # Попадание в ноту
         self.match_group = QGroupBox("🎯 Попадание в ноту")
         match_layout = QVBoxLayout()
@@ -754,6 +789,29 @@ class MainWindow(QMainWindow):
 
         type_desc = self.analyzer.voice_type_detector.get_voice_type_description(voice_type)
         self.voice_type_label.setText(type_desc)
+
+        # Регистр (плавная шкала грудной..фальцет)
+        register = result.get('register')
+        if register:
+            self.register_label.setText(register['label'])
+            self.register_progress.setValue(int(register['register_mix'] * 100))
+
+        # Зажатость / срывы
+        strain = result.get('strain')
+        if strain:
+            self.strain_label.setText(strain['note'])
+            self.strain_progress.setValue(int(strain['strain_score'] * 100))
+            if strain['break_detected']:
+                self.strain_progress.setStyleSheet("QProgressBar::chunk { background-color: #fa5252; }")
+            elif strain['strain_score'] > 0.6:
+                self.strain_progress.setStyleSheet("QProgressBar::chunk { background-color: #ffa94d; }")
+            else:
+                self.strain_progress.setStyleSheet("QProgressBar::chunk { background-color: #51cf66; }")
+
+        # Текстовая подсказка "как от препода"
+        feedback = self.analyzer.get_coach_feedback(result)
+        if feedback:
+            self.coach_label.setText(f"{feedback['headline']} — {feedback['detail']}")
 
         if result.get('pitch_match'):
             match = result['pitch_match']
